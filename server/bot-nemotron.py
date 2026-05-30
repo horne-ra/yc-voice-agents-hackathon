@@ -460,9 +460,9 @@ async def bot(runner_args: RunnerArguments):
                 ),
             )
         case WebSocketRunnerArguments():
-            # Twilio media streams are 8 kHz μ-law in both directions.
-            # This overrides the default sample rates: 16 kHz in / 24 kHz out.
-            transport_overrides["audio_in_sample_rate"] = 8000
+            # Twilio media streams are 8 kHz mu-law, but NVIDIA ASR expects
+            # 16 kHz PCM input. Keep pipeline input at 16 kHz and only emit
+            # Twilio-compatible 8 kHz output.
             transport_overrides["audio_out_sample_rate"] = 8000
 
             # Parse Twilio websocket and fetch call information
