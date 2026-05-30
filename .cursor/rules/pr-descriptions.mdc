@@ -1,0 +1,45 @@
+---
+description: Use this structure for GitHub PR descriptions (fill TICKET_ID, Summary, What Changed, Files Modified table).
+alwaysApply: true
+---
+
+# Pull request descriptions
+
+When the user asks for a PR description, pull request body, or review summary for a GitHub PR, **use this exact markdown skeleton**. Replace placeholders with real content; omit sections only if truly N/A (say so briefly in Summary).
+
+## Template
+
+```markdown
+# PR Description — {TICKET_ID}
+
+---
+
+## Summary
+
+{One paragraph: what this PR does, why, and the user-facing behavior change. Reference the ticket ID. Mention key implementation approach (e.g., "CSS-only", "no new dependencies"). Call out what is NOT changed if relevant.}
+
+---
+
+## What Changed
+
+- **{Area 1}**: {Concise description of changes in this area. Include specific values, class names, props, config — be precise enough that a reviewer knows what to look for.}
+- **{Area 2}**: {Same format. Group by logical area: Frontend, Backend, Tests, Config, Infra, etc.}
+- **Tests**: {What tests were added/updated. Note any testing limitations (e.g., "not asserted in JSDOM due to mocked CSS").}
+
+---
+
+## Files Modified
+
+| Area   | File               | Change                                           |
+| ------ | ------------------ | ------------------------------------------------ |
+| {Area} | `{path/to/file}`   | {Brief description of what changed in this file} |
+| {Area} | `{path/to/file}`   | {Brief description}                              |
+
+---
+```
+
+## Rules
+
+- Keep **headings and horizontal rules** as shown so PRs stay consistent.
+- **TICKET_ID**: use the ticket from the branch or user (e.g. `LEGAL-001`, `JIRA-123`); if unknown, use `TBD` and note it in Summary.
+- **Files Modified** table: list every touched file that matters for review; group **Area** (e.g. Frontend, Docs, CI).

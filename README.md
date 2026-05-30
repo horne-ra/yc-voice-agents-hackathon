@@ -90,6 +90,17 @@ kubectl scale deployment/inference-svc --replicas=0
 kubectl scale deployment/inference-svc --replicas=4
 ```
 
+Manual phone-call check:
+
+```bash
+TWILIO_AUDIO_OUT_10MS_CHUNKS=10 TWILIO_TTS_FULL_TURN_COALESCE=false \
+  uv run bot-nemotron.py -t twilio --port 7861
+```
+
+Dial the Twilio number and verify that first-word latency is acceptable, that the bot
+can be interrupted during speech, and that a short direct approval such as "uh approve"
+executes only after the proposal.
+
 Delete the cluster when finished:
 
 ```bash

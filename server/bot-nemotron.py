@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import aiohttp
@@ -36,6 +37,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.aggregators.llm_text_processor import LLMTextProcessor
 from pipecat.runner.types import (
     DailyRunnerArguments,
     RunnerArguments,
@@ -52,6 +54,8 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
+from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 from pipecat.workers.runner import WorkerRunner
 
 from nemotron_llm import VLLMOpenAILLMService
@@ -64,6 +68,8 @@ if str(KELDRON_TOOLS) not in sys.path:
 
 import k8s_actions
 
+load_dotenv(override=True)
+
 DATADOG_ALERT_PATH = KELDRON_REPO / "fixtures" / "datadog-alert.json"
 APPROVAL_PHRASES = {
     "approve",
@@ -71,6 +77,7 @@ APPROVAL_PHRASES = {
     "yes",
     "yeah",
     "uh yes",
+    "uh approve",
     "yes approve",
     "approve it",
     "uh yes approve it",
@@ -86,8 +93,70 @@ APPROVAL_PHRASES = {
     "do it please",
     "proceed",
 }
+APPROVAL_WORDS = {"approve", "approved", "yes", "yeah", "yep", "yup", "proceed"}
+APPROVAL_FILLER_WORDS = {"uh", "um", "umm", "ok", "okay", "please", "alright", "allright"}
+APPROVAL_ACTION_WORDS = {"approve", "approved", "yes", "yeah", "yep", "yup", "proceed", "go", "ahead", "do", "it", "that", "this", "please"}
+APPROVAL_REJECTION_WORDS = {
+    "no",
+    "not",
+    "don",
+    "dont",
+    "why",
+    "what",
+    "when",
+    "where",
+    "how",
+    "would",
+    "could",
+    "should",
+    "can",
+    "you",
+}
 
-load_dotenv(override=True)
+_KEEP_ASYNC_GENERATOR = False
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer for {}={!r}; using {}", name, value, default)
+        return default
+
+# Twilio outbound PCM is chunked in 10 ms units before mu-law encode.
+TWILIO_AUDIO_OUT_10MS_CHUNKS = _env_int("TWILIO_AUDIO_OUT_10MS_CHUNKS", 10)
+TWILIO_TTS_FULL_TURN_COALESCE = _env_bool("TWILIO_TTS_FULL_TURN_COALESCE", False)
+
+
+class TurnTextAggregator(SimpleTextAggregator):
+    """Buffer a full LLM turn before TTS on the Twilio path."""
+
+    def __init__(self):
+        super().__init__(aggregation_type=AggregationType.SENTENCE)
+
+    async def aggregate(self, text: str) -> AsyncIterator[Aggregation]:
+        self._text += text
+        # Keep this as an async generator while preserving buffer-until-flush.
+        # LLMTextProcessor consumes aggregate() with async for and flushes on LLM end.
+        if _KEEP_ASYNC_GENERATOR:
+            yield Aggregation(text="", type=AggregationType.SENTENCE)
+
+    async def flush(self) -> Aggregation | None:
+        if self._text:
+            result = self._text
+            await self.reset()
+            return Aggregation(text=result.strip(" "), type=AggregationType.SENTENCE)
+        return None
 
 
 def _normalize_approval_text(text: str) -> str:
@@ -95,6 +164,33 @@ def _normalize_approval_text(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return " ".join(text.split())
+
+
+def _is_semantic_approval(text: str) -> bool:
+    """Return True for short, direct affirmative approval utterances."""
+    approval = _normalize_approval_text(text)
+    if approval in APPROVAL_PHRASES:
+        return True
+
+    words = approval.split()
+    if not words:
+        return False
+
+    if any(word in APPROVAL_REJECTION_WORDS for word in words):
+        return False
+
+    meaningful = [word for word in words if word not in APPROVAL_FILLER_WORDS]
+    if not meaningful or len(meaningful) > 5:
+        return False
+
+    if any(word in APPROVAL_WORDS for word in meaningful):
+        return all(word in APPROVAL_ACTION_WORDS for word in meaningful)
+
+    return meaningful in (
+        ["go", "ahead"],
+        ["go", "ahead", "and", "do", "it"],
+        ["do", "it"],
+    )
 
 
 def _last_user_text(params: FunctionCallParams) -> str:
@@ -156,6 +252,7 @@ async def run_bot(
     from_number: str | None = None,
     audio_in_sample_rate: int = 16000,
     audio_out_sample_rate: int = 24000,
+    telephony_tts_coalesce: bool = False,
 ):
     """Main bot logic.
 
@@ -164,6 +261,7 @@ async def run_bot(
         from_number: Caller's phone number on the Twilio path.
         audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
         audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
+        telephony_tts_coalesce: When True, send one TTS segment per LLM turn (Twilio path).
     """
     logger.info("Starting bot")
 
@@ -206,7 +304,7 @@ async def run_bot(
             node: Kubernetes node to drain after explicit approval.
         """
         approval = _normalize_approval_text(_last_user_text(params))
-        if approval not in APPROVAL_PHRASES:
+        if not _is_semantic_approval(approval):
             logger.warning(
                 "Refusing drain_node for node {} because last user utterance was {!r}",
                 node,
@@ -261,15 +359,18 @@ async def run_bot(
         "- Require explicit, unambiguous spoken approval before any action.\n"
         "- Approval is valid only as a direct, unprompted affirmative the operator offers "
         "on their own in response to your single Approve question. Treat approval as "
-        "explicit only when the operator's complete utterance is "
+        "explicit only when the operator's complete utterance is a short direct "
+        "affirmative such as "
         "approve, approved, yes, yeah, uh yes, yes approve, approve it, "
         "uh yes approve it, yes approve it, yes please, yep, yup, please do, "
         "go ahead, go ahead please, go ahead and do it, do it, do it please, "
-        "or proceed.\n"
+        "or proceed. Minor filler words like uh, ok, or please are acceptable.\n"
         "- Never chase, re-solicit, or re-ask for approval. You ask once, then wait "
         "silently for the operator to decide on their own.\n"
         "- A question, a hedge, idle chatter, or ambiguous input is never approval and "
         "never triggers a drain.\n"
+        "- Do not call drain_node unless the operator's latest complete utterance is a "
+        "short direct affirmative approval. Extra words around approve are ambiguous.\n"
         "- If the operator approves, call drain_node for the proposed target node. "
         "After drain_node returns, call cluster_status before speaking the result.\n"
         "- If drain_node returns ok false or an error, say plainly that the drain did "
@@ -293,8 +394,11 @@ async def run_bot(
         "stop. Do not re-ask for approval. Do not say Approval noted. End your turn after "
         "the explanation.\n"
         "- If the operator says anything off-topic, conversational, disengaging, hedging, "
-        "or ambiguous after the proposal: reply once with exactly: Standing by. No action "
-        "taken. Then stay silent on the approval question. Do not re-ask. Do not nag.\n"
+        "or ambiguous after the proposal: give one brief acknowledgement that no action was "
+        "taken, then stop. Do not keep repeating the same standby phrase. Do not re-ask. "
+        "Do not nag.\n"
+        "- If a drain_node tool call is rejected because approval was not explicit, say: "
+        "I heard extra words around approval, so I did not drain the node.\n"
         "- If the operator clearly disengages, says goodbye, or says they are leaving: "
         "acknowledge briefly and do not ask for approval again.\n\n"
         "Spoken output style:\n"
@@ -376,18 +480,24 @@ async def run_bot(
         ),
     )
 
-    # Pipeline - assembled from reusable components
-    pipeline = Pipeline(
+    pipeline_processors = [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+    ]
+    if telephony_tts_coalesce:
+        pipeline_processors.append(LLMTextProcessor(text_aggregator=TurnTextAggregator()))
+    pipeline_processors.extend(
         [
-            transport.input(),
-            stt,
-            user_aggregator,
-            llm,
             tts,
             transport.output(),
             assistant_aggregator,
         ]
     )
+
+    # Pipeline - assembled from reusable components
+    pipeline = Pipeline(pipeline_processors)
 
     worker = PipelineWorker(
         pipeline,
@@ -489,6 +599,7 @@ async def bot(runner_args: RunnerArguments):
             # 16 kHz PCM input. Keep pipeline input at 16 kHz and only emit
             # Twilio-compatible 8 kHz output.
             transport_overrides["audio_out_sample_rate"] = 8000
+            transport_overrides["telephony_tts_coalesce"] = TWILIO_TTS_FULL_TURN_COALESCE
 
             # Parse Twilio websocket and fetch call information
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
@@ -512,6 +623,7 @@ async def bot(runner_args: RunnerArguments):
                     audio_in_enabled=True,
                     audio_in_filter=krisp_filter,
                     audio_out_enabled=True,
+                    audio_out_10ms_chunks=TWILIO_AUDIO_OUT_10MS_CHUNKS,
                     add_wav_header=False,
                     serializer=serializer,
                 ),
