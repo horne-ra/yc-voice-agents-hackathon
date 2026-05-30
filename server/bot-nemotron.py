@@ -276,6 +276,15 @@ async def run_bot(
         "not complete and do not claim rescheduling.\n"
         "- Propose exactly one remediation: cordon and drain the affected node so its "
         "workload reschedules to the healthy node.\n\n"
+        "Silent tool behavior:\n"
+        "- Never speak internal tool plans or next-step narration. Do not say I need to "
+        "check, I should check, I will check, or similar planning phrases.\n"
+        "- Tool inspection is silent. Speak only after you have the observed cluster state.\n"
+        "- If the initial prompt says read-only checks are already completed, use those "
+        "observations directly for the first brief instead of announcing tool use.\n"
+        "- If the observed state shows no pods on the affected node, or the affected node "
+        "is already unschedulable and empty, do not propose a drain and do not ask Approve. "
+        "State that no action is needed because there is nothing to reschedule.\n\n"
         "Asking for approval, exactly once:\n"
         "- Ask Approve only one time, at the very end of your initial proposal. Never "
         "append Approve, or any restated request for approval, to any later turn.\n"
@@ -394,16 +403,32 @@ async def run_bot(
     async def on_client_connected(transport, client):
         logger.info("Client connected")
         alert_context = json.dumps(alert, indent=2, sort_keys=True)
+        try:
+            initial_cluster_status = k8s_actions.cluster_status()
+        except k8s_actions.KubectlError as exc:
+            initial_cluster_status = {"ok": False, "error": str(exc)}
+        try:
+            initial_affected_pods = {"pods": k8s_actions.list_pods(affected_node)}
+        except k8s_actions.KubectlError as exc:
+            initial_affected_pods = {"ok": False, "error": str(exc)}
+
         context.add_message(
             {
                 "role": "user",
                 "content": (
-                    "Datadog alert received. Use tools before speaking a proposal.\n"
+                    "Datadog alert received. Read-only checks were completed before "
+                    "this turn using cluster_status and list_pods.\n"
                     f"Affected node from alert hostname: {affected_node}\n"
-                    "Do not speak yet. First call cluster_status. Then call list_pods with "
-                    "that affected node. After both read-only checks, give the short spoken "
-                    "proposal and ask Approve?\n\n"
-                    f"Alert payload:\n{alert_context}"
+                    "Do not announce tool usage, do not say you need to check anything, "
+                    "and do not call another tool before the first brief unless these "
+                    "observations are invalid. Give only the operator-facing brief.\n"
+                    "If the affected node is already empty or unschedulable, say no drain "
+                    "is proposed and do not ask Approve.\n\n"
+                    f"Alert payload:\n{alert_context}\n\n"
+                    "Observed cluster_status result:\n"
+                    f"{json.dumps(initial_cluster_status, indent=2, sort_keys=True)}\n\n"
+                    f"Observed list_pods result for {affected_node}:\n"
+                    f"{json.dumps(initial_affected_pods, indent=2, sort_keys=True)}"
                 ),
             }
         )
