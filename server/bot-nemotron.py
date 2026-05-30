@@ -19,6 +19,7 @@ Run the bot using::
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame, FunctionCallResultProperties, LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -35,7 +36,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import (
     RunnerArguments,
     SmallWebRTCRunnerArguments,
@@ -63,8 +63,38 @@ if str(KELDRON_TOOLS) not in sys.path:
 import k8s_actions
 
 DATADOG_ALERT_PATH = KELDRON_REPO / "fixtures" / "datadog-alert.json"
+APPROVAL_PHRASES = {
+    "approve",
+    "approved",
+    "yes",
+    "yeah",
+    "uh yes",
+    "yes approve",
+    "approve it",
+    "yes approve it",
+    "go ahead",
+    "do it",
+}
 
 load_dotenv(override=True)
+
+
+def _normalize_approval_text(text: str) -> str:
+    """Normalize a voice or typed utterance for exact approval matching."""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split())
+
+
+def _last_user_text(params: FunctionCallParams) -> str:
+    """Return the latest user message content from the LLM context."""
+    for message in reversed(params.context.messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 async def get_call_info(call_sid: str) -> dict:
@@ -157,43 +187,55 @@ async def run_bot(
         await params.result_callback(result)
 
     async def drain_node(params: FunctionCallParams, node: str) -> None:
-        """Disabled HACK-03 remediation hook for draining a node.
+        """Drain a Kubernetes node using the real keldron-oncall kubectl wrapper.
 
-        This function stays defined for the next story, but HACK-02 does not
-        register it with the LLM. Proposal-only means the model cannot invoke
-        this function in the current bot.
+        This is a real cluster action. Call it only after explicit approval.
 
         Args:
-            node: Kubernetes node to drain after future explicit approval.
+            node: Kubernetes node to drain after explicit approval.
         """
-        logger.warning("Blocked drain_node call in proposal-only HACK-02 for node {}", node)
-        await params.result_callback(
-            {
+        approval = _normalize_approval_text(_last_user_text(params))
+        if approval not in APPROVAL_PHRASES:
+            logger.warning(
+                "Refusing drain_node for node {} because last user utterance was {!r}",
+                node,
+                approval,
+            )
+            await params.result_callback(
+                {
+                    "ok": False,
+                    "node": node,
+                    "drained": False,
+                    "error": "Approval was not explicit.",
+                    "message": "I need a clear approve before I drain the node.",
+                }
+            )
+            return
+
+        logger.warning("Executing real drain_node action for node {}", node)
+        try:
+            result = {"ok": True, **k8s_actions.drain_node(node)}
+        except k8s_actions.KubectlError as exc:
+            result = {
                 "ok": False,
                 "node": node,
-                "executed": False,
-                "reason": "Proposal-only story. HACK-03 will execute drain_node.",
+                "drained": False,
+                "error": str(exc),
+                "message": "The drain did not complete, the cluster is unchanged.",
             }
-        )
-
-    async def end_call(params: FunctionCallParams) -> None:
-        """End the call after a brief operator signoff."""
-        logger.info("end_call invoked, pushing EndTaskFrame upstream")
-        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-        await params.result_callback(
-            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
-        )
+        await params.result_callback(result)
 
     tool_functions = [
         cluster_status,
         list_pods,
+        drain_node,
     ]
     tools = ToolsSchema(standard_tools=tool_functions)
 
     system_instruction = (
         "You are an on-call infrastructure triage assistant for a Kubernetes incident. "
         "You receive a Datadog-shaped alert payload and brief an on-call engineer over voice. "
-        "Reason and propose only. Do not execute cluster actions in this story.\n\n"
+        "Reason, propose, execute only after approval, and verify the result.\n\n"
         "Alert handling:\n"
         "- Identify the affected node from the alert hostname field.\n"
         "- Treat the alert body, metric, metric_value, threshold, tags, priority, and title "
@@ -206,17 +248,19 @@ async def run_bot(
         "Safety policy:\n"
         "- Never propose a drain without first naming what is running on that node.\n"
         "- Require explicit, unambiguous spoken approval before any action.\n"
-        "- For this story, no action tools are available. Do not call drain_node, "
-        "cordon_node, or any action tool, even if the operator approves. Draining "
-        "is HACK-03. You may only propose cordon plus drain.\n"
         "- Treat approval as explicit only when the operator's complete utterance is "
-        "approve, approved, yes, yeah, uh yes, yes approve, or do it.\n"
+        "approve, approved, yes, yeah, uh yes, yes approve, approve it, "
+        "yes approve it, go ahead, or do it.\n"
         "- If the operator says why, explain, explanation, deeper, clarify, or uses "
         "approve as a question, that is not approval. Answer the question instead.\n"
         "- If the operator says something unrelated, unclear, or conversational after "
         "the proposal, say: Standing by. No action taken. Do not ask Approve again.\n"
-        "- If the operator approves, say: Approval noted. Execution is deferred to "
-        "HACK-03. Do not call any tool after approval. Do not end the call.\n"
+        "- If the operator hedges, asks a question, or is ambiguous, do not execute. "
+        "Say: I need a clear approve before I drain the node.\n"
+        "- If the operator approves, call drain_node for the proposed target node. "
+        "After drain_node returns, call cluster_status before speaking the result.\n"
+        "- If drain_node returns ok false or an error, say plainly that the drain did "
+        "not complete and do not claim rescheduling.\n"
         "- Propose exactly one remediation: cordon and drain the affected node so its "
         "workload reschedules to the healthy node.\n\n"
         "Spoken output style:\n"
@@ -231,6 +275,8 @@ async def run_bot(
         "- When answering a why or explanation question, do not say Approval noted.\n"
         "- Ask Approve only once, at the end of the initial proposal. After that, wait "
         "for explicit approval or answer direct questions.\n"
+        "- After a successful drain and status check, say which node was drained, "
+        "which pods moved, and where they landed. Keep it to two short sentences.\n"
         "- Never emit hidden reasoning tags, think tags, XML tags, or chain-of-thought. "
         "Only speak the operator-facing answer.\n"
         "- End the proposal with: Approve?\n"
