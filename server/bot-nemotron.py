@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import EndTaskFrame, FunctionCallResultProperties, LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -38,6 +38,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.aggregators.llm_text_processor import LLMTextProcessor
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import (
     DailyRunnerArguments,
     RunnerArguments,
@@ -93,9 +94,37 @@ APPROVAL_PHRASES = {
     "do it please",
     "proceed",
 }
-APPROVAL_WORDS = {"approve", "approved", "yes", "yeah", "yep", "yup", "proceed"}
-APPROVAL_FILLER_WORDS = {"uh", "um", "umm", "ok", "okay", "please", "alright", "allright"}
-APPROVAL_ACTION_WORDS = {"approve", "approved", "yes", "yeah", "yep", "yup", "proceed", "go", "ahead", "do", "it", "that", "this", "please"}
+APPROVAL_WORDS = {"approval", "approve", "approved", "yes", "yeah", "yep", "yup", "proceed"}
+APPROVAL_FILLER_WORDS = {
+    "uh",
+    "um",
+    "umm",
+    "ok",
+    "okay",
+    "please",
+    "alright",
+    "allright",
+    "sounds",
+    "good",
+}
+APPROVAL_ACTION_WORDS = {
+    "approval",
+    "approve",
+    "approved",
+    "yes",
+    "yeah",
+    "yep",
+    "yup",
+    "proceed",
+    "go",
+    "ahead",
+    "and",
+    "do",
+    "it",
+    "that",
+    "this",
+    "please",
+}
 APPROVAL_REJECTION_WORDS = {
     "no",
     "not",
@@ -168,6 +197,10 @@ def _normalize_approval_text(text: str) -> str:
 
 def _is_semantic_approval(text: str) -> bool:
     """Return True for short, direct affirmative approval utterances."""
+    raw_text = text.strip().lower()
+    if "?" in raw_text:
+        return False
+
     approval = _normalize_approval_text(text)
     if approval in APPROVAL_PHRASES:
         return True
@@ -303,8 +336,9 @@ async def run_bot(
         Args:
             node: Kubernetes node to drain after explicit approval.
         """
-        approval = _normalize_approval_text(_last_user_text(params))
-        if not _is_semantic_approval(approval):
+        user_text = _last_user_text(params)
+        approval = _normalize_approval_text(user_text)
+        if not _is_semantic_approval(user_text):
             logger.warning(
                 "Refusing drain_node for node {} because last user utterance was {!r}",
                 node,
@@ -334,10 +368,19 @@ async def run_bot(
             }
         await params.result_callback(result)
 
+    async def end_call(params: FunctionCallParams) -> None:
+        """End the call after a successful drain confirmation has been spoken."""
+        logger.info("end_call invoked; pushing EndTaskFrame upstream")
+        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+        await params.result_callback(
+            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
+        )
+
     tool_functions = [
         cluster_status,
         list_pods,
         drain_node,
+        end_call,
     ]
     tools = ToolsSchema(standard_tools=tool_functions)
 
@@ -373,6 +416,10 @@ async def run_bot(
         "short direct affirmative approval. Extra words around approve are ambiguous.\n"
         "- If the operator approves, call drain_node for the proposed target node. "
         "After drain_node returns, call cluster_status before speaking the result.\n"
+        "- After a successful drain and successful status check, first speak the "
+        "final confirmation, then call end_call. Do not call end_call before the "
+        "operator has heard the final confirmation. Do not call end_call after an "
+        "ambiguous response or a failed drain.\n"
         "- If drain_node returns ok false or an error, say plainly that the drain did "
         "not complete and do not claim rescheduling.\n"
         "- Propose exactly one remediation: cordon and drain the affected node so its "
@@ -390,9 +437,14 @@ async def run_bot(
         "- Ask Approve only one time, at the very end of your initial proposal. Never "
         "append Approve, or any restated request for approval, to any later turn.\n"
         "- If the operator asks why, or asks for an explanation, clarification, or more "
-        "detail: give one concise explanation based on the alert and tool results, then "
-        "stop. Do not re-ask for approval. Do not say Approval noted. End your turn after "
-        "the explanation.\n"
+        "detail: give a concise technical explanation based on the alert and tool "
+        "results, then stop. Include the CPU value and threshold, the affected node "
+        "and workload count, why cordon plus drain is the Kubernetes-safe move, and "
+        "the expected reschedule target. Mention that cordon prevents new scheduling "
+        "and drain evicts the existing pods for the Deployment or ReplicaSet to "
+        "recreate on a schedulable healthy worker. Keep it to three to five short "
+        "sentences. Do not re-ask for approval. Do not say Approval noted. End your "
+        "turn after the explanation.\n"
         "- If the operator says anything off-topic, conversational, disengaging, hedging, "
         "or ambiguous after the proposal: give one brief acknowledgement that no action was "
         "taken, then stop. Do not keep repeating the same standby phrase. Do not re-ask. "
@@ -411,7 +463,8 @@ async def run_bot(
         "hashes aloud. Refer to pods by count or short name, using the pod names returned "
         "by list_pods.\n"
         "- After a successful drain and status check, say which node was drained, "
-        "which pods moved, and where they landed. Keep it to two short sentences.\n"
+        "which pods moved, and where they landed. Keep it to two short sentences, "
+        "then call end_call so the phone call ends cleanly.\n"
         "- Never emit hidden reasoning tags, think tags, XML tags, internal phase names, "
         "or chain-of-thought. Only speak the operator-facing answer.\n"
     )

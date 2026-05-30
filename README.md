@@ -99,7 +99,8 @@ TWILIO_AUDIO_OUT_10MS_CHUNKS=10 TWILIO_TTS_FULL_TURN_COALESCE=false \
 
 Dial the Twilio number and verify that first-word latency is acceptable, that the bot
 can be interrupted during speech, and that a short direct approval such as "uh approve"
-executes only after the proposal.
+executes only after the proposal. After the successful drain confirmation, verify that
+the bot ends the phone call cleanly.
 
 Delete the cluster when finished:
 
@@ -113,5 +114,4 @@ Delete the cluster when finished:
 
 ## Known limitations
 
-- The bot does not cleanly hang up at the end of a call. Sessions were force-ended during testing.
 - Phone audio can be choppy over the tunnel.
