@@ -169,6 +169,32 @@ kubectl rollout status deployment/inference-svc --timeout=60s
 kubectl get pods -o wide
 ```
 
+### Tunnel setup
+
+Twilio needs a public HTTPS/WSS endpoint to reach your local bot on port **7861**. Use **ngrok**
+or **Cloudflare Tunnel** (either works).
+
+**ngrok:**
+
+```bash
+ngrok http 7861
+```
+
+Copy the **Forwarding** hostname from the ngrok terminal (for example `abc123.ngrok-free.app`).
+Use only the hostname, not `https://`.
+
+**Cloudflare Tunnel:**
+
+```bash
+cloudflared tunnel --url http://localhost:7861
+```
+
+Copy the public URL Cloudflare prints (for example `xyz.trycloudflare.com`). Use only the
+hostname.
+
+Set that hostname in `server/.env` as `PUBLIC_TUNNEL_HOST`, and pass the same value to the bot
+`-x` flag below.
+
 Run the Twilio phone bot locally behind the current tunnel:
 
 ```bash
