@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2026, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -7,7 +7,7 @@
 """vLLM OpenAI-compatible LLM service that times TTFB to the first NON-THINKING token.
 
 Stock pipecat (``BaseOpenAILLMService._process_context``) stops the TTFB clock on
-the first streamed chunk that carries any ``choices`` (base_llm.py:467) — i.e. the
+the first streamed chunk that carries any ``choices`` (base_llm.py:467), i.e. the
 first role / reasoning delta. For a reasoning model served with thinking enabled
 (Nemotron-3-Super over vLLM), the answer (``content``) tokens do not begin until
 the model finishes thinking, so the stock metric badly understates TTFB (in
@@ -41,23 +41,64 @@ class VLLMOpenAILLMService(OpenAILLMService):
         """Initialize the service; see OpenAILLMService for accepted args."""
         super().__init__(*args, **kwargs)
         self._ttft_armed = False
+        self._inside_inline_thought = False
+
+    def _strip_inline_thought_markup(self, text: str) -> str:
+        """Strip inline think markup if vLLM sends it as visible content."""
+        output: list[str] = []
+        index = 0
+        lower = text.lower()
+
+        while index < len(text):
+            if self._inside_inline_thought:
+                end = lower.find("</think>", index)
+                if end == -1:
+                    return "".join(output)
+                index = end + len("</think>")
+                self._inside_inline_thought = False
+                continue
+
+            start = lower.find("<think>", index)
+            stray_end = lower.find("</think>", index)
+
+            if stray_end != -1 and (start == -1 or stray_end < start):
+                output.append(text[index:stray_end])
+                index = stray_end + len("</think>")
+                continue
+
+            if start == -1:
+                output.append(text[index:])
+                break
+
+            output.append(text[index:start])
+            index = start + len("<think>")
+            end = lower.find("</think>", index)
+            if end == -1:
+                self._inside_inline_thought = True
+                break
+            index = end + len("</think>")
+
+        return "".join(output)
 
     async def get_chat_completions(self, context):
         """Wrap the chunk stream to arm TTFB on the first content/tool delta.
 
         ``_process_context`` calls this once per turn, right after
-        ``start_ttfb_metrics()`` and before iterating — so reset the per-turn
+        ``start_ttfb_metrics()`` and before iterating, so reset the per-turn
         arming flag here.
         """
         self._ttft_armed = False
+        self._inside_inline_thought = False
         stream = await super().get_chat_completions(context)
 
         async def _armed_stream():
             try:
                 async for chunk in stream:
+                    choices = getattr(chunk, "choices", None)
+                    delta = getattr(choices[0], "delta", None) if choices else None
+                    if delta is not None and getattr(delta, "content", None):
+                        delta.content = self._strip_inline_thought_markup(delta.content)
                     if not self._ttft_armed:
-                        choices = getattr(chunk, "choices", None)
-                        delta = getattr(choices[0], "delta", None) if choices else None
                         # First non-thought token = first text content or tool call.
                         if delta is not None and (
                             getattr(delta, "content", None) or getattr(delta, "tool_calls", None)
