@@ -90,7 +90,7 @@ kubectl scale deployment/inference-svc --replicas=0
 kubectl scale deployment/inference-svc --replicas=4
 ```
 
-Manual phone-call check:
+Manual phone-call check (inbound, HACK-08):
 
 ```bash
 TWILIO_AUDIO_OUT_10MS_CHUNKS=10 TWILIO_TTS_FULL_TURN_COALESCE=false \
@@ -101,6 +101,27 @@ Dial the Twilio number and verify that first-word latency is acceptable, that th
 can be interrupted during speech, and that a short direct approval such as "uh approve"
 executes only after the proposal. After the successful drain confirmation, verify that
 the bot ends the phone call cleanly.
+
+Outbound pager (HACK-09):
+
+1. Cluster up and pods at 2/2 on agent nodes (see above).
+2. Start a tunnel to port 7861 (e.g. `ngrok http 7861`) and set `PUBLIC_TUNNEL_HOST` in `.env`.
+3. Start the bot with the tunnel hostname:
+
+```bash
+cd server
+TWILIO_AUDIO_OUT_10MS_CHUNKS=10 TWILIO_TTS_FULL_TURN_COALESCE=false \
+  uv run bot-nemotron.py -t twilio -x your-tunnel.example.com --port 7861
+```
+
+4. Page the operator (Twilio calls you; you do not dial in):
+
+```bash
+cd server
+uv run page_operator.py
+```
+
+5. Answer the phone. The bot briefs the alert and runs the full triage loop. Approve by voice to execute a real drain on k3d.
 
 Delete the cluster when finished:
 
