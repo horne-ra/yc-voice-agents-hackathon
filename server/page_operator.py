@@ -41,11 +41,11 @@ def _clean_host(host: str) -> str:
 
 
 async def main() -> None:
-    account_sid = os.environ["TWILIO_ACCOUNT_SID"]
-    auth_token = os.environ["TWILIO_AUTH_TOKEN"]
+    account_sid = _require_env("TWILIO_ACCOUNT_SID")
+    auth_token = _require_env("TWILIO_AUTH_TOKEN")
     from_number = _require_env("TWILIO_PHONE_NUMBER")
     to_number = _require_env("OPERATOR_PHONE")
-    tunnel_host = _clean_host(os.environ["PUBLIC_TUNNEL_HOST"])
+    tunnel_host = _clean_host(_require_env("PUBLIC_TUNNEL_HOST"))
 
     if ALERT_PATH.is_file():
         alert = json.loads(ALERT_PATH.read_text())
@@ -71,6 +71,9 @@ async def main() -> None:
             print(f"Call SID: {data.get('sid')}  status: {data.get('status')}")
     except asyncio.TimeoutError:
         print("Twilio API request timed out", file=sys.stderr)
+        sys.exit(1)
+    except aiohttp.ClientError as e:
+        print(f"Twilio API request failed: {e}", file=sys.stderr)
         sys.exit(1)
 
 
