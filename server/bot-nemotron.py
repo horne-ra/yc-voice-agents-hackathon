@@ -71,9 +71,18 @@ APPROVAL_PHRASES = {
     "uh yes",
     "yes approve",
     "approve it",
+    "uh yes approve it",
     "yes approve it",
+    "yes please",
+    "yep",
+    "yup",
+    "please do",
     "go ahead",
+    "go ahead please",
+    "go ahead and do it",
     "do it",
+    "do it please",
+    "proceed",
 }
 
 load_dotenv(override=True)
@@ -250,7 +259,9 @@ async def run_bot(
         "- Require explicit, unambiguous spoken approval before any action.\n"
         "- Treat approval as explicit only when the operator's complete utterance is "
         "approve, approved, yes, yeah, uh yes, yes approve, approve it, "
-        "yes approve it, go ahead, or do it.\n"
+        "uh yes approve it, yes approve it, yes please, yep, yup, please do, "
+        "go ahead, go ahead please, go ahead and do it, do it, do it please, "
+        "or proceed.\n"
         "- If the operator says why, explain, explanation, deeper, clarify, or uses "
         "approve as a question, that is not approval. Answer the question instead.\n"
         "- If the operator says something unrelated, unclear, or conversational after "
