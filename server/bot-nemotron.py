@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import aiohttp
@@ -36,6 +37,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.aggregators.llm_text_processor import LLMTextProcessor
 from pipecat.runner.types import (
     DailyRunnerArguments,
     RunnerArguments,
@@ -52,6 +54,8 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
+from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 from pipecat.workers.runner import WorkerRunner
 
 from nemotron_llm import VLLMOpenAILLMService
@@ -88,6 +92,28 @@ APPROVAL_PHRASES = {
 }
 
 load_dotenv(override=True)
+
+# Twilio outbound PCM is chunked in 10 ms units before mu-law encode.
+TWILIO_AUDIO_OUT_10MS_CHUNKS = 20
+
+
+class TurnTextAggregator(SimpleTextAggregator):
+    """Buffer a full LLM turn before TTS on the Twilio path."""
+
+    def __init__(self):
+        super().__init__(aggregation_type=AggregationType.SENTENCE)
+
+    async def aggregate(self, text: str) -> AsyncIterator[Aggregation]:
+        self._text += text
+        if False:
+            yield Aggregation(text="", type=AggregationType.SENTENCE)
+
+    async def flush(self) -> Aggregation | None:
+        if self._text:
+            result = self._text
+            await self.reset()
+            return Aggregation(text=result.strip(" "), type=AggregationType.SENTENCE)
+        return None
 
 
 def _normalize_approval_text(text: str) -> str:
@@ -156,6 +182,7 @@ async def run_bot(
     from_number: str | None = None,
     audio_in_sample_rate: int = 16000,
     audio_out_sample_rate: int = 24000,
+    telephony_tts_coalesce: bool = False,
 ):
     """Main bot logic.
 
@@ -164,6 +191,7 @@ async def run_bot(
         from_number: Caller's phone number on the Twilio path.
         audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
         audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
+        telephony_tts_coalesce: When True, send one TTS segment per LLM turn (Twilio path).
     """
     logger.info("Starting bot")
 
@@ -376,18 +404,24 @@ async def run_bot(
         ),
     )
 
-    # Pipeline - assembled from reusable components
-    pipeline = Pipeline(
+    pipeline_processors = [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+    ]
+    if telephony_tts_coalesce:
+        pipeline_processors.append(LLMTextProcessor(text_aggregator=TurnTextAggregator()))
+    pipeline_processors.extend(
         [
-            transport.input(),
-            stt,
-            user_aggregator,
-            llm,
             tts,
             transport.output(),
             assistant_aggregator,
         ]
     )
+
+    # Pipeline - assembled from reusable components
+    pipeline = Pipeline(pipeline_processors)
 
     worker = PipelineWorker(
         pipeline,
@@ -489,6 +523,7 @@ async def bot(runner_args: RunnerArguments):
             # 16 kHz PCM input. Keep pipeline input at 16 kHz and only emit
             # Twilio-compatible 8 kHz output.
             transport_overrides["audio_out_sample_rate"] = 8000
+            transport_overrides["telephony_tts_coalesce"] = True
 
             # Parse Twilio websocket and fetch call information
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
@@ -512,6 +547,7 @@ async def bot(runner_args: RunnerArguments):
                     audio_in_enabled=True,
                     audio_in_filter=krisp_filter,
                     audio_out_enabled=True,
+                    audio_out_10ms_chunks=TWILIO_AUDIO_OUT_10MS_CHUNKS,
                     add_wav_header=False,
                     serializer=serializer,
                 ),
