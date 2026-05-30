@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2026, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -133,5 +133,29 @@ def test_arm_resets_per_turn():
             async for _ in wrapped:
                 pass
         assert svc._ttft_armed is False  # no content this turn
+
+    asyncio.run(run())
+
+
+def test_inline_thought_markup_is_removed_from_content():
+    async def run():
+        svc = VLLMOpenAILLMService(model="m", api_key="EMPTY", base_url="http://x/v1")
+        upstream = _FakeStream(
+            [
+                _chunk(content="Visible. </think> Still visible."),
+                _chunk(content="<think>hidden"),
+                _chunk(content=" hidden</think> Answer."),
+            ]
+        )
+
+        with patch.object(
+            OpenAILLMService, "get_chat_completions", new=AsyncMock(return_value=upstream)
+        ):
+            wrapped = await svc.get_chat_completions(context=None)
+            contents = []
+            async for chunk in wrapped:
+                contents.append(chunk.choices[0].delta.content)
+
+        assert contents == ["Visible.  Still visible.", "", " Answer."]
 
     asyncio.run(run())

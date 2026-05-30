@@ -1,16 +1,15 @@
 #
-# Copyright (c) 2024–2026, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Field & Flower — flower shop voice ordering bot (hackathon starter).
+"""On-call infrastructure triage voice bot.
 
-A customer calls in and the bot helps them pick a bouquet and arrange delivery.
-All backend calls (catalog, customer lookup, order placement) are mocked so the
-starter runs with no external dependencies beyond the AI services.
+The bot briefs a Datadog-shaped alert, inspects Kubernetes state with read-only
+tools, and proposes one remediation for operator approval.
 
-Pipeline: Nemotron Speech Streaming STT → Nemotron-3-Super-120B LLM → Gradium TTS, with direct
+Pipeline: Nemotron Speech Streaming STT to Nemotron-3-Super-120B LLM to Gradium TTS, with direct
 function tools registered on the LLM context.
 
 Run the bot using::
@@ -18,16 +17,18 @@ Run the bot using::
     uv run bot-nemotron.py
 """
 
+import json
 import os
-import random
-from datetime import date
+import re
+import sys
+from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame, FunctionCallResultProperties, LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -35,8 +36,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import (
+    DailyRunnerArguments,
     RunnerArguments,
     SmallWebRTCRunnerArguments,
     WebSocketRunnerArguments,
@@ -46,17 +47,65 @@ from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.gradium.tts import GradiumTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from mock_backend import BOUQUETS, KNOWN_CUSTOMERS
 from nemotron_llm import VLLMOpenAILLMService
 from nvidia_stt import NVidiaWebSocketSTTService
 
+KELDRON_REPO = Path(__file__).resolve().parents[2] / "keldron-oncall"
+KELDRON_TOOLS = KELDRON_REPO / "tools"
+if str(KELDRON_TOOLS) not in sys.path:
+    sys.path.insert(0, str(KELDRON_TOOLS))
+
+import k8s_actions
+
+DATADOG_ALERT_PATH = KELDRON_REPO / "fixtures" / "datadog-alert.json"
+APPROVAL_PHRASES = {
+    "approve",
+    "approved",
+    "yes",
+    "yeah",
+    "uh yes",
+    "yes approve",
+    "approve it",
+    "uh yes approve it",
+    "yes approve it",
+    "yes please",
+    "yep",
+    "yup",
+    "please do",
+    "go ahead",
+    "go ahead please",
+    "go ahead and do it",
+    "do it",
+    "do it please",
+    "proceed",
+}
+
 load_dotenv(override=True)
+
+
+def _normalize_approval_text(text: str) -> str:
+    """Normalize a voice or typed utterance for exact approval matching."""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split())
+
+
+def _last_user_text(params: FunctionCallParams) -> str:
+    """Return the latest user message content from the LLM context."""
+    for message in reversed(params.context.messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 async def get_call_info(call_sid: str) -> dict:
@@ -112,256 +161,164 @@ async def run_bot(
 
     Args:
         transport: The transport to use.
-        from_number: Caller's phone number (Twilio path only) for known-customer lookup.
+        from_number: Caller's phone number on the Twilio path.
         audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
         audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
     """
     logger.info("Starting bot")
 
-    # Per-call order state. Closed over by the tool functions below so each
-    # call gets its own isolated order.
-    order: dict = {"items": [], "delivery": None}
+    with DATADOG_ALERT_PATH.open() as alert_file:
+        alert = json.load(alert_file)
 
-    # --- Tools the LLM can call ---------------------------------------------
+    affected_node = alert.get("hostname", "unknown")
 
-    async def list_bouquets(
-        params: FunctionCallParams,
-        occasion: str | None = None,
-        specials_only: bool = False,
-    ) -> None:
-        """List bouquets available today. Optionally filter by occasion or by
-        what's currently on special.
+    async def cluster_status(params: FunctionCallParams) -> None:
+        """Return a read-only cluster snapshot of nodes and pods by node.
 
-        Use this when the caller asks what's available, mentions a specific
-        occasion ("it's for my mom's birthday", "for Valentine's Day", "for a
-        funeral"), or asks about specials/deals. Sold-out bouquets are
-        automatically excluded from results.
+        Use this before recommending any remediation. This tool only reads
+        Kubernetes state through keldron-oncall/tools/k8s_actions.py.
+        """
+        try:
+            result = k8s_actions.cluster_status()
+        except k8s_actions.KubectlError as exc:
+            result = {"ok": False, "error": str(exc)}
+        await params.result_callback(result)
+
+    async def list_pods(params: FunctionCallParams, node: str | None = None) -> None:
+        """Return default-namespace pods, optionally filtered to one node.
 
         Args:
-            occasion: Lowercase occasion to filter by. Common values:
-                "birthday", "anniversary", "valentine's day", "mother's day",
-                "sympathy", "wedding", "graduation", "thank you", "get well",
-                "new baby", "housewarming", "christmas", "easter", "just
-                because". Pass the canonical short form ("birthday", not "mom's
-                birthday"). Omit to return the full catalog.
-            specials_only: If True, only return bouquets currently on special.
+            node: Kubernetes node name to inspect. Use the alert hostname when
+                naming what is running on the affected node.
         """
-        results = []
-        for name, info in BOUQUETS.items():
-            if not info["in_stock"]:
-                continue
-            if specials_only and not info.get("on_special", False):
-                continue
-            if occasion is not None:
-                occ = occasion.strip().lower()
-                tags = [o.lower() for o in info.get("occasions", [])]
-                if not any(occ in tag or tag in occ for tag in tags):
-                    continue
-            results.append({"name": name, **info})
+        try:
+            result = {"pods": k8s_actions.list_pods(node)}
+        except k8s_actions.KubectlError as exc:
+            result = {"ok": False, "error": str(exc)}
+        await params.result_callback(result)
 
-        if not results and (occasion is not None or specials_only):
+    async def drain_node(params: FunctionCallParams, node: str) -> None:
+        """Drain a Kubernetes node using the real keldron-oncall kubectl wrapper.
+
+        This is a real cluster action. Call it only after explicit approval.
+
+        Args:
+            node: Kubernetes node to drain after explicit approval.
+        """
+        approval = _normalize_approval_text(_last_user_text(params))
+        if approval not in APPROVAL_PHRASES:
+            logger.warning(
+                "Refusing drain_node for node {} because last user utterance was {!r}",
+                node,
+                approval,
+            )
             await params.result_callback(
                 {
-                    "bouquets": [],
-                    "note": (
-                        "No bouquets match those filters. Tell the caller you don't have "
-                        "anything specifically for that, and offer to browse the full "
-                        "catalog or try a different angle."
-                    ),
+                    "ok": False,
+                    "node": node,
+                    "drained": False,
+                    "error": "Approval was not explicit.",
+                    "message": "I need a clear approve before I drain the node.",
                 }
             )
             return
 
-        await params.result_callback({"bouquets": results})
-
-    async def check_availability(params: FunctionCallParams, bouquet_name: str) -> None:
-        """Check whether a specific bouquet is in stock today.
-
-        Args:
-            bouquet_name: The name of the bouquet to check, lowercase.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"available": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"available": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        await params.result_callback({"available": True, "price": item["price"]})
-
-    async def add_to_order(
-        params: FunctionCallParams, bouquet_name: str, quantity: int = 1
-    ) -> None:
-        """Add a bouquet to the customer's order. Only call this after the
-        customer has confirmed they want this bouquet.
-
-        Args:
-            bouquet_name: The name of the bouquet to add, lowercase.
-            quantity: How many of this bouquet to add. Defaults to 1.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"ok": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"ok": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        order["items"].append(
-            {"bouquet": bouquet_name.lower(), "quantity": quantity, "price": item["price"]}
-        )
-        await params.result_callback({"ok": True, "items": order["items"]})
-
-    async def get_order_summary(params: FunctionCallParams) -> None:
-        """Read back the current order: items, quantities, and running total."""
-        total = sum(line["price"] * line["quantity"] for line in order["items"])
-        await params.result_callback(
-            {"items": order["items"], "total": round(total, 2), "delivery": order["delivery"]}
-        )
-
-    async def set_delivery_details(
-        params: FunctionCallParams,
-        recipient_name: str,
-        address: str,
-        delivery_date: str,
-    ) -> None:
-        """Capture delivery details for the order.
-
-        Args:
-            recipient_name: Name of the person receiving the flowers.
-            address: Delivery street address.
-            delivery_date: Requested delivery date, in the customer's own words
-                (e.g. "Friday", "May 20th"). No parsing required.
-        """
-        order["delivery"] = {
-            "recipient_name": recipient_name,
-            "address": address,
-            "delivery_date": delivery_date,
-        }
-        await params.result_callback({"ok": True, "delivery": order["delivery"]})
-
-    async def place_order(params: FunctionCallParams) -> None:
-        """Finalize the order. Only call this after the customer has confirmed
-        the items AND delivery details."""
-        if not order["items"]:
-            await params.result_callback({"ok": False, "reason": "No items in the order yet."})
-            return
-        if not order["delivery"]:
-            await params.result_callback({"ok": False, "reason": "Missing delivery details."})
-            return
-        total = sum(line["price"] * line["quantity"] for line in order["items"])
-        confirmation = f"FLW-{random.randint(100000, 999999)}"
-        logger.info(f"Order placed: {confirmation} total=${total:.2f} order={order}")
-        await params.result_callback(
-            {
-                "ok": True,
-                "confirmation_number": confirmation,
-                "total": round(total, 2),
-                "eta": "within 2 business days",
+        logger.warning("Executing real drain_node action for node {}", node)
+        try:
+            result = {"ok": True, **k8s_actions.drain_node(node)}
+        except k8s_actions.KubectlError as exc:
+            result = {
+                "ok": False,
+                "node": node,
+                "drained": False,
+                "error": str(exc),
+                "message": "The drain did not complete, the cluster is unchanged.",
             }
-        )
-
-    async def end_call(params: FunctionCallParams) -> None:
-        """End the call. Only call this AFTER you have said goodbye to the
-        customer in the same turn. The pipeline will flush any queued speech
-        and then hang up."""
-        logger.info("end_call invoked — pushing EndTaskFrame upstream")
-        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-        # run_llm=False prevents the LLM from generating a follow-up response
-        # after this function returns — the goodbye should already be in flight.
-        await params.result_callback(
-            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
-        )
+        await params.result_callback(result)
 
     tool_functions = [
-        list_bouquets,
-        check_availability,
-        add_to_order,
-        get_order_summary,
-        set_delivery_details,
-        place_order,
-        end_call,
+        cluster_status,
+        list_pods,
+        drain_node,
     ]
     tools = ToolsSchema(standard_tools=tool_functions)
 
-    # --- System instruction (varies based on caller ID) ---------------------
-
-    customer = KNOWN_CUSTOMERS.get(from_number or "")
-    if customer:
-        caller_context = (
-            f"This caller is a returning customer (caller ID matched). On file: "
-            f"name {customer['name']}, last order the {customer['last_order']} bouquet. "
-            'Greet them generically: "Welcome back to Field & Flower! How can I help '
-            'today?" Do not use their name or mention their last order in the greeting; '
-            "that comes across as surveilling. Once they say they want flowers, you "
-            "can offer their last order as a helpful shortcut, framed as record-keeping: "
-            f'"I have you down for the {customer["last_order"]} last time, want that '
-            'again or something different?" Always give them the alternative.'
-        )
-    else:
-        caller_context = (
-            "You're talking to a new customer. Introduce the shop briefly and ask how you can help."
-        )
-
     system_instruction = (
-        "You are a friendly order-taker for Field & Flower, a neighborhood flower shop. "
-        "Help callers pick a bouquet and arrange delivery. Use the tools to look up "
-        "bouquets, check stock, add items, capture delivery details, and place the order. "
-        "Confirm the full order before calling place_order.\n\n"
-        "Talk like a real shop clerk on the phone — not a chatbot:\n"
-        "- Keep it to 1–2 short sentences per turn. Longer only when listing options or "
-        "doing the final order read-back.\n"
-        "- Ask ONE thing at a time. Don't ask for name, address, and date in one breath — "
-        "ask for the name, wait, then the next.\n"
-        '- Skip filler openers like "Absolutely!", "That sounds lovely!", "Perfect!", '
-        '"I\'d be happy to" — go straight to the point.\n'
-        "- Describe bouquets plainly. \"A dozen red roses with baby's breath, sixty-five "
-        'dollars." Not "a classic, romantic bouquet showing love and appreciation."\n'
-        "- When listing bouquets, ALWAYS lead with the bouquet's name. Format: "
-        '"<Name> — <description>, <price>." For example: "Spring Sunshine — yellow tulips '
-        'and daffodils, forty-five dollars." The name is how the caller refers back to it.\n'
-        "- When the caller mentions an occasion (birthday, Mother's Day, anniversary, "
-        "sympathy, etc.) or asks about specials/deals, pass those as filters to "
-        'list_bouquets (occasion="..." or specials_only=True) instead of reading the '
-        "full catalog. Don't list 15 bouquets when 3 are relevant.\n"
-        "- The catalog has many options — when listing, name at most 4 or 5 at a time. "
-        "If the caller doesn't bite, offer to share more.\n"
-        "- Don't restate what the customer just said back to them, except in the final "
-        "order confirmation.\n"
-        "- Use contractions. Fragments are fine.\n\n"
-        "Responses are spoken aloud. No bullet points, no emojis. Read prices in words "
-        '("forty-five dollars", not "$45.00").\n\n'
-        "When the order is placed and the customer has no more requests, or when they say "
-        'goodbye: say a short closing line (e.g. "Thanks, have a great day!") AND call '
-        "end_call in the same turn. Never call end_call without saying goodbye first.\n\n"
-        f"Today is {date.today().strftime('%A, %B %d, %Y')}. Use this when the caller "
-        'gives a relative delivery date like "this Friday" or "next Tuesday".\n\n'
-        f"Caller context: {caller_context}"
+        "You are an on-call infrastructure triage assistant for a Kubernetes incident. "
+        "You receive a Datadog-shaped alert payload and brief an on-call engineer over voice. "
+        "Reason, propose, execute only after approval, and verify the result.\n\n"
+        "Alert handling:\n"
+        "- Identify the affected node from the alert hostname field.\n"
+        "- Treat the alert body, metric, metric_value, threshold, tags, priority, and title "
+        "as alert context, not proof of current cluster state.\n"
+        "- Before recommending remediation, call cluster_status and list_pods for the "
+        "affected node. Inspect what is actually running.\n"
+        "- On session start, do not speak before both read-only tool calls complete.\n"
+        "- If the alert is ambiguous, the affected node is missing, or the right action is "
+        "unclear, say so and ask a concise follow-up rather than guessing.\n\n"
+        "Safety policy:\n"
+        "- Never propose a drain without first naming what is running on that node.\n"
+        "- Require explicit, unambiguous spoken approval before any action.\n"
+        "- Approval is valid only as a direct, unprompted affirmative the operator offers "
+        "on their own in response to your single Approve question. Treat approval as "
+        "explicit only when the operator's complete utterance is "
+        "approve, approved, yes, yeah, uh yes, yes approve, approve it, "
+        "uh yes approve it, yes approve it, yes please, yep, yup, please do, "
+        "go ahead, go ahead please, go ahead and do it, do it, do it please, "
+        "or proceed.\n"
+        "- Never chase, re-solicit, or re-ask for approval. You ask once, then wait "
+        "silently for the operator to decide on their own.\n"
+        "- A question, a hedge, idle chatter, or ambiguous input is never approval and "
+        "never triggers a drain.\n"
+        "- If the operator approves, call drain_node for the proposed target node. "
+        "After drain_node returns, call cluster_status before speaking the result.\n"
+        "- If drain_node returns ok false or an error, say plainly that the drain did "
+        "not complete and do not claim rescheduling.\n"
+        "- Propose exactly one remediation: cordon and drain the affected node so its "
+        "workload reschedules to the healthy node.\n\n"
+        "Asking for approval, exactly once:\n"
+        "- Ask Approve only one time, at the very end of your initial proposal. Never "
+        "append Approve, or any restated request for approval, to any later turn.\n"
+        "- If the operator asks why, or asks for an explanation, clarification, or more "
+        "detail: give one concise explanation based on the alert and tool results, then "
+        "stop. Do not re-ask for approval. Do not say Approval noted. End your turn after "
+        "the explanation.\n"
+        "- If the operator says anything off-topic, conversational, disengaging, hedging, "
+        "or ambiguous after the proposal: reply once with exactly: Standing by. No action "
+        "taken. Then stay silent on the approval question. Do not re-ask. Do not nag.\n"
+        "- If the operator clearly disengages, says goodbye, or says they are leaving: "
+        "acknowledge briefly and do not ask for approval again.\n\n"
+        "Spoken output style:\n"
+        "- Keep it short and operator-appropriate. No retail language, no small talk, "
+        "no long explanations.\n"
+        "- Speak conversationally, not in field-label format. For example: Agent-0 is "
+        "running hot, CPU is at 94 percent, past threshold, with two inference pods on it. "
+        "I would drain it and move them to agent-1. Approve?\n"
+        "- Name the pods currently running on the target node, but do not read full pod "
+        "hashes aloud. Refer to pods by count or short name, using the pod names returned "
+        "by list_pods.\n"
+        "- After a successful drain and status check, say which node was drained, "
+        "which pods moved, and where they landed. Keep it to two short sentences.\n"
+        "- Never emit hidden reasoning tags, think tags, XML tags, internal phase names, "
+        "or chain-of-thought. Only speak the operator-facing answer.\n"
     )
 
     # Speech-to-Text service
     #
     # Nemotron Speech Streaming STT, served over WebSocket. The server expects
-    # 16-bit PCM, 16 kHz, mono — matching the WebRTC input path. The URL can be
+    # 16-bit PCM, 16 kHz, mono, matching the WebRTC input path. The URL can be
     # overridden via NVIDIA_ASR_URL.
     stt = NVidiaWebSocketSTTService(
         url=os.getenv("NVIDIA_ASR_URL", "ws://192.168.7.228:8081"),
         strip_interim_prefix=True,
     )
 
-    # LLM service — Nemotron-3-Super-120B served by vLLM (OpenAI-compatible chat
+    # LLM service: Nemotron-3-Super-120B served by vLLM (OpenAI-compatible chat
     # completions at /v1). vLLM exposes the Chat Completions API, not the Responses
     # API, so we use OpenAILLMService (not OpenAIResponsesLLMService). The live
     # endpoint serves the model as "nemotron-3-super" (per its /v1/models).
     #
-    # Reasoning ("thinking") toggle — Nemotron is controlled per-request via
+    # Reasoning ("thinking") toggle: Nemotron is controlled per-request via
     # chat_template_kwargs.enable_thinking, forwarded through the OpenAI client's
     # extra_body (the request-body convention confirmed against this endpoint in
     # ../aiewf-eval traces). Default OFF for low-latency voice. To ENABLE, set
@@ -436,11 +393,18 @@ async def run_bot(
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
-        # Kick off the conversation
+        alert_context = json.dumps(alert, indent=2, sort_keys=True)
         context.add_message(
             {
                 "role": "user",
-                "content": "A customer just called. Greet them, 'This is Field & Flower, your local flower shop. How can I help you today?'",
+                "content": (
+                    "Datadog alert received. Use tools before speaking a proposal.\n"
+                    f"Affected node from alert hostname: {affected_node}\n"
+                    "Do not speak yet. First call cluster_status. Then call list_pods with "
+                    "that affected node. After both read-only checks, give the short spoken "
+                    "proposal and ask Approve?\n\n"
+                    f"Alert payload:\n{alert_context}"
+                ),
             }
         )
         await worker.queue_frames([LLMRunFrame()])
@@ -471,6 +435,19 @@ async def bot(runner_args: RunnerArguments):
         krisp_filter = None
 
     match runner_args:
+        case DailyRunnerArguments():
+            # Daily room transport — used for Cekura Pipecat WebRTC (v1) test runs.
+            # The bot joins the same Daily room that the Cekura testing agent joins.
+            transport = DailyTransport(
+                runner_args.room_url,
+                runner_args.token,
+                "On-Call Triage Bot",
+                params=DailyParams(
+                    audio_in_enabled=True,
+                    audio_in_filter=krisp_filter,
+                    audio_out_enabled=True,
+                ),
+            )
         case SmallWebRTCRunnerArguments():
             webrtc_connection: SmallWebRTCConnection = runner_args.webrtc_connection
 
@@ -491,8 +468,7 @@ async def bot(runner_args: RunnerArguments):
             # Parse Twilio websocket and fetch call information
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
 
-            # Fetch call information from Twilio REST API so we can personalize
-            # the bot for known customers (see KNOWN_CUSTOMERS).
+            # Fetch call information from Twilio REST API for telephony metadata.
             call_info = await get_call_info(call_data["call_id"])
             if call_info:
                 from_number = call_info.get("from_number")
