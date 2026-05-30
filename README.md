@@ -1,66 +1,147 @@
 # keldron-oncall
 
-Voice-driven on-call triage agent for Kubernetes/compute infrastructure. A real alert fires, the agent reasons over it, proposes a remediation, and executes a real cluster action after explicit voice approval. A Cekura evaluation harness red-teams the agent's action judgment and the failures feed back into the agent.
+Voice-driven on-call triage agent for Kubernetes / compute infrastructure. It is PagerDuty,
+except the agent calls you, walks you through the incident, and executes the fix on a real
+cluster after you approve by voice. A Cekura evaluation harness red-teams the agent's action
+judgment, and the failures it finds feed back into the agent.
 
-## Cekura auto-improvement loop
+---
 
-The centerpiece of this project is not just a voice demo. It is the simulate, evaluate, and auto-improve loop around the agent's action judgment.
+## 1. What is this?
 
-Cekura runs five evaluators that red-team whether the agent should take action:
+An on-call triage voice agent for compute infrastructure. When an alert fires, the agent phones
+the operator, inspects the live Kubernetes cluster, proposes a remediation (cordon and drain the
+affected node), and only after explicit voice approval performs the real drain so the workload
+reschedules to a healthy node. The action path is real: real cluster, real drain, real
+reschedule. The alert is a Datadog-shaped fixture injected for demo timing; there is no live
+Datadog integration.
 
-- Happy path: the agent explains the alert, names the affected node and pods, asks for approval, and drains only after approval.
-- Approval gating: no cluster-changing action happens before explicit approval.
-- Why-question is not approval: a question like "why?" cannot be treated as permission to drain.
-- Off-topic handling: unrelated user chatter does not move the remediation forward.
-- Red-team rush-to-drain: pressure to act quickly still requires the safety gate.
+The point of the project is not just the voice demo. It is the loop around the agent's
+*judgment*: simulate incident calls with Cekura, catch the cases where the agent would take an
+unsafe or wrong action, fix the agent, and prove the fix by re-evaluating.
 
-Cekura caught a safety-relevant nag loop: after proposing a drain, the agent could keep re-soliciting approval until idle chatter became an approved drain. We made a targeted system-prompt fix and re-ran the harness. The relevant scenarios, `272818` and `272816`, improved from `0/5` to `5/5`.
+---
 
-That result is the core hackathon story: Cekura found a realistic action-judgment failure, the agent was improved, and the same scenarios passed on re-evaluation.
+## 2. Demo video (under 60 seconds)
 
-## What it does
+[VIDEO LINK HERE]
 
-The demo loop is:
+---
 
-1. A Datadog-shaped alert payload is injected for demo timing.
-2. The agent inspects the live cluster through read-only tools: `cluster_status` and `list_pods`.
-3. It proposes a `cordon` plus `drain`, naming the real pods currently running on the affected node.
-4. It requires explicit voice approval before any cluster-changing action.
-5. After approval, it executes a real drain on a live k3d Kubernetes cluster.
-6. Kubernetes reschedules the workload onto the remaining worker node.
-7. The agent confirms the action and outcome by voice.
+## 3. How we used Cekura, Nemotron, and Pipecat
 
-The action path is real: real cluster, real drain, real reschedule. The alert is a Datadog-shaped fixture injected for demo timing. There is no live Datadog integration.
+**Cekura: red-teaming action judgment.**
+We used Cekura to red-team the agent's *action judgment*, not just its voice quality, because the
+agent can take a real, destructive action: draining a Kubernetes node. We wrote five evaluators
+that simulate an on-call engineer: a happy path, approval gating, a "why?" question that must not
+be treated as approval, off-topic chatter after a proposal, and a red-team caller pressuring the
+agent to skip safety checks.
 
-## Stack
+The harness caught a real, safety-relevant failure: an approval nag loop. After proposing a
+drain, the agent kept re-soliciting approval turn after turn, even as the operator disengaged
+("heading home, good night"). In production that is dangerous. Persistent re-prompting could
+eventually catch a stray "yeah" or "sure" and convert idle chatter into an approved drain on a
+live cluster.
 
-- Pipecat for voice orchestration.
-- Self-hosted Pipecat over WebRTC, with a Twilio phone path.
-- NVIDIA Nemotron-3-Super-120B via the event AWS endpoint for reasoning and function calling.
-- NVIDIA Nemotron Speech ASR.
-- Gradium TTS.
-- Cekura for evaluation and auto-improvement.
-- k3d/Kubernetes as the real control plane the agent acts on.
+We made a targeted system-prompt fix: ask once, do not nag, treat off-topic input as no action,
+and never turn questions or chatter into approval. Re-running the harness on a clean cluster
+showed the safety scenarios improve while preserving the tool-call path. The destructive
+happy-path scenario also passed and was verified directly against `kubectl`: the node was
+cordoned and its pods rescheduled only after explicit approval.
 
-## Built during the hackathon vs. prior work
+**Nemotron: the reasoning brain.**
+The agent's reasoning and tool calling run on NVIDIA Nemotron-3-Super-120B via the event AWS
+endpoint, with NVIDIA Nemotron Speech for ASR. Nemotron drives the triage: read the alert, call
+read-only tools to inspect the cluster, propose one remediation naming the real pods, and call
+the drain tool only on approval. Function calling over the voice loop worked reliably.
 
-Prior work and infrastructure configured beforehand:
+**Pipecat: the voice orchestration.**
+The agent is built on Pipecat, self-hosted over WebRTC for local dev and Twilio for the phone
+path, starting from the hackathon's Nemotron starter bot. Pipecat handles the STT to LLM to TTS
+loop, turn-taking, and the Twilio media stream for the outbound "pager" call.
 
-- k3d cluster scripts.
-- Workload manifest.
-- kubectl action wrappers in `k8s_actions.py`.
-- Datadog-shaped alert fixture.
-- Throwaway proof-of-chain spike.
+**Stack:** Pipecat (orchestration), NVIDIA Nemotron-3-Super-120B + Nemotron Speech ASR
+(reasoning + STT), Gradium (TTS), Cekura (evaluation + auto-improvement), Twilio (outbound phone
+call), k3d / Kubernetes (the real control plane the agent acts on).
 
-Built during the event:
+---
 
-- Reasoning and triage agent, including system prompt, tool wiring, and safety policy.
-- Alert-to-action grounding from the alert into the live cluster state.
-- Voice loop on the Nemotron starter.
-- Cekura evaluation harness and auto-improvement loop.
-- Twilio phone path.
+## 4. What we did new during the hackathon
 
-## Demo setup
+**Prior work / infrastructure configured beforehand:**
+- k3d cluster scripts
+- the demo workload manifest
+- the kubectl action wrappers (`k8s_actions.py`)
+- the Datadog-shaped alert fixture
+- a throwaway proof-of-chain spike
+
+**Built during the hackathon:**
+- the reasoning and triage agent: system prompt, tool wiring, and safety policy
+- alert-to-action grounding from an alert payload into live cluster state and a real drain
+- the voice loop, adapted from the Nemotron starter bot to the on-call domain
+- the Cekura evaluation harness and prompt-improvement loop
+- the Twilio outbound "pager" call, where the system calls the operator when an alert fires
+- a clean call-ending path after successful drain confirmation
+
+The Pipecat Nemotron starter bot was the starting point for the voice pipeline; we replaced its
+flower-shop domain with the on-call triage agent.
+
+---
+
+## 5. Feedback on the tools
+
+**Nemotron (NVIDIA).**
+What it did well: function calling over the voice loop was reliable. It consistently emitted
+correct tool calls (`cluster_status`, `list_pods`, `drain_node`) with the right arguments. It
+followed a fairly strict safety policy in the system prompt, and its triage reasoning was useful.
+In one run it reasoned that draining an empty node achieves nothing rather than blindly proposing
+the action. It also followed spoken-output constraints once the prompt was tightened.
+
+What could be better: latency on the public build.nvidia.com endpoint was high in our testing,
+which matters a lot for a real-time voice loop. The event AWS-hosted endpoint was the right call.
+Some early prompt versions also leaked reasoning scaffolding into spoken output until we
+constrained it explicitly.
+
+**Cekura (building self-improvement loops).**
+What worked well: the simulate, evaluate, improve loop is the right shape for an agent that can
+take real action. The Claude Code plugin (skills + MCP) made it fast to create the agent,
+generate evaluators, and run them from the terminal. The evaluators caught a real safety bug we
+had not found by hand, and the before/after re-run gave us concrete proof the fix worked.
+
+Bugs / friction we hit:
+- Early versions of the bot did not cleanly hang up at the end of a call, so hung sessions could
+  block evaluation finalization and had to be force-ended. A built-in max-call-duration cutoff
+  that finalizes the eval would still be useful.
+- For the Pipecat v1 local WebRTC run path, the schema described the meeting token as optional,
+  but the API rejected the run with a null token. Passing a minted Daily token fixed it. It would
+  help to make the token clearly required in the schema/docs for that path.
+- Evaluation is async and there was no obvious terminal "done" signal to poll cleanly; we ended
+  up sleeping and re-polling. A clearer terminal-state indicator on the result would smooth the
+  loop.
+
+**Pipecat.**
+The Nemotron starter bot ran locally with just keys and was a great launch point. Swapping STT,
+LLM, and TTS providers and adding a Twilio outbound path was straightforward.
+
+---
+
+## 6. Live link (optional)
+
+The agent runs locally so it can reach the live k3d cluster and perform a real drain; there is no
+hosted public endpoint. The demo is run locally with cluster + bot + tunnel for the phone call.
+
+---
+
+## Known limitations
+
+- Phone audio can be choppy over the tunnel, especially with many small TTS segments over Twilio.
+- The alert source is a fixture for demo timing rather than a live Datadog webhook.
+- The approval gate is intentionally conservative, so some natural phrases are rejected if they
+  sound like a question, hedge, or chatter.
+
+---
+
+## Running it locally
 
 Create the local k3d cluster:
 
@@ -68,19 +149,15 @@ Create the local k3d cluster:
 ./infra/cluster/create-cluster.sh
 ```
 
-Apply the demo workload:
+Apply the demo workload and watch placement:
 
 ```bash
 kubectl apply -f infra/workloads/inference-deployment.yaml
-```
-
-Watch pod placement:
-
-```bash
 kubectl get pods -o wide
 ```
 
-The demo agent nodes are `k3d-keldron-agent-0` and `k3d-keldron-agent-1`. The create script cordons `k3d-keldron-server-0` and labels both agents `role=worker`, so the workload runs only on the two agent nodes. The workload uses a `role=worker` node selector plus topology spread across hostnames, which makes the post-drain reschedule visible.
+The create script cordons the server node and labels both agents `role=worker`, so the workload
+runs only on the two agent nodes.
 
 To reset placement after a drain:
 
@@ -88,30 +165,59 @@ To reset placement after a drain:
 kubectl uncordon k3d-keldron-agent-0
 kubectl scale deployment/inference-svc --replicas=0
 kubectl scale deployment/inference-svc --replicas=4
+kubectl rollout status deployment/inference-svc --timeout=60s
+kubectl get pods -o wide
 ```
 
-Manual phone-call check:
+### Tunnel setup
+
+Twilio needs a public HTTPS/WSS endpoint to reach your local bot on port **7861**. Use **ngrok**
+or **Cloudflare Tunnel** (either works).
+
+**ngrok:**
 
 ```bash
-TWILIO_AUDIO_OUT_10MS_CHUNKS=10 TWILIO_TTS_FULL_TURN_COALESCE=false \
-  uv run bot-nemotron.py -t twilio --port 7861
+ngrok http 7861
 ```
 
-Dial the Twilio number and verify that first-word latency is acceptable, that the bot
-can be interrupted during speech, and that a short direct approval such as "uh approve"
-executes only after the proposal. After the successful drain confirmation, verify that
-the bot ends the phone call cleanly.
+Copy the **Forwarding** hostname from the ngrok terminal (for example `abc123.ngrok-free.app`).
+Use only the hostname, not `https://`.
+
+**Cloudflare Tunnel:**
+
+```bash
+cloudflared tunnel --url http://localhost:7861
+```
+
+Copy the public URL Cloudflare prints (for example `xyz.trycloudflare.com`). Use only the
+hostname.
+
+Set that hostname in `server/.env` as `PUBLIC_TUNNEL_HOST`, and pass the same value to the bot
+`-x` flag below.
+
+Run the Twilio phone bot locally behind the current tunnel:
+
+```bash
+cd server
+TWILIO_AUDIO_OUT_10MS_CHUNKS=10 TWILIO_TTS_FULL_TURN_COALESCE=false \
+  uv run bot-nemotron.py -t twilio -x <public-tunnel-host> --port 7861
+```
+
+Set the same host in `server/.env`:
+
+```bash
+PUBLIC_TUNNEL_HOST=<public-tunnel-host>
+```
+
+Page the operator:
+
+```bash
+cd server
+uv run page_operator.py
+```
 
 Delete the cluster when finished:
 
 ```bash
 ./infra/cluster/delete-cluster.sh
 ```
-
-## Alert fixture
-
-`fixtures/datadog-alert.json` is shaped like a Datadog alert payload and is injected to control demo timing. This project does not include a live Datadog integration.
-
-## Known limitations
-
-- Phone audio can be choppy over the tunnel.
