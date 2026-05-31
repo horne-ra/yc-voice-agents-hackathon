@@ -24,7 +24,7 @@ unsafe or wrong action, fix the agent, and prove the fix by re-evaluating.
 
 ## 2. Demo video (under 60 seconds)
 
-[VIDEO LINK HERE]
+https://youtu.be/eVR7pS35cfs
 
 ---
 
